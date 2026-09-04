@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <stdlib.h>
 sqlite3* db;//所有线程共用一个数据库
 struct net_info
 {
@@ -111,6 +112,11 @@ void my_list(int newfd,struct net_info s)
 {
 	//1.opendir + readdir
 	DIR* dp=opendir(s.username);//打开当前账户的文件夹
+	if(dp==NULL)
+	{
+		printf("打开目录失败");
+		return;
+	}
 	struct dirent* ep=readdir(dp);//读数据
 	while(ep!=NULL)
 	{
@@ -122,6 +128,7 @@ void my_list(int newfd,struct net_info s)
 		}
 		ep=readdir(dp);//读取下一个文件
 	}
+	closedir(dp);
 	insert_history(s.username,"list");//记录当下操作
 }
 //下载文件
@@ -200,6 +207,7 @@ void my_history(int newfd,struct net_info s)
 void* func(void* p)
 {
 	int newfd = *(int *)p;//将进程中的newfd的值取出，保存到线程 栈区的变量里
+	free(p);
 	while(1)
 	{
 		//5.收数据
@@ -237,6 +245,7 @@ void* func(void* p)
 		}
 	}
 	close(newfd);//链接通道关闭
+	return NULL;
 }
 
 int main()
@@ -267,8 +276,13 @@ int main()
     {
         int newfd = accept(sockfd, NULL, NULL);
     	printf("newfd %d\n", newfd);
+		//不写下面这两行会有bug
+		int* p=malloc(sizeof(int));
+		*p=newfd;
+
     	pthread_t id;
-    	pthread_create(&id, NULL, func, &newfd);//将newfd作为参数传进去
+    	pthread_create(&id, NULL, func, p);//将newfd作为参数传进去
+		pthread_detach(id);//线程跑完自动回收资源
     }
     
     //6.关闭
