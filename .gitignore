@@ -1,0 +1,41 @@
+# 编译生成文件
+# C/C++ 编译文件
+*.o
+*.a
+*.so
+
+# 测试数据文件
+client/a1
+client/a6
+server/wsx/a1
+server/wsx/a2
+server/wsx/a3
+server/wsx/a4
+server/wsx/a5
+server/wsx/a6
+
+# SQLite 数据库
+*.db
+
+# 临时文件
+*.swp
+*.swo
+*~
+
+# 日志
+*.log*.o
+*.out
+*.a
+*.so
+
+# 可执行文件
+client/client
+server/server
+
+# 临时文件
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
