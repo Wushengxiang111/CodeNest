@@ -138,6 +138,7 @@ void my_get(int newfd,struct net_info s)
 	char address[100];
 	sprintf(address,"%s/%s",s.username,s.filename);
 	FILE* fp=fopen(address,"r");
+	fseek(fp,s.info_len,SEEK_SET);//移动文件指针位置
 	if(fp==NULL)
 	{
 		printf("打开失败");
@@ -150,6 +151,9 @@ void my_get(int newfd,struct net_info s)
 			s.info_len=ret;
 			send(newfd,&s,sizeof(s),0);
 			ret=fread(s.info,1,sizeof(s.info),fp);
+			//两行测试代码
+			printf("下载长度:%d\n",s.info_len);
+			sleep(2);//两秒延迟
 		}
 		fclose(fp);
 	}

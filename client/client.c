@@ -130,9 +130,33 @@ int main(int argc, char* argv[])
 			{
 				printf("请输入您要下载的文件名:\n");
 				scanf("%s",s.filename);
-				strcpy(s.username,loginUsername);
-				FILE* fp=fopen(s.filename,"w");//将文件清空
-				fclose(fp);
+				FILE* fp1=fopen(s.filename,"r");//判断文件是否存在
+				if(fp1==NULL)//文件不存在
+				{
+					;//
+				}
+				else//文件存在
+				{
+					int download;
+					printf("文件存在，是否要继续下载,0不下载，1下载\n");
+					scanf("%d",&download);
+					if(download==0)//不继续下载
+					{
+						strcpy(s.username,loginUsername);
+						FILE* fp=fopen(s.filename,"w");//将文件清空
+						fclose(fp);
+					}
+					else if(download==1)//继续下载
+					{
+						fclose(fp1);//关闭只读
+						strcpy(s.username,loginUsername);
+						FILE* fp=fopen(s.filename,"r");//读取文件
+						s.info_len==0;
+						fseek(fp,0,SEEK_END);
+						s.info_len=ftell(fp);//求文件大小
+						fclose(fp);
+					}
+				}
 			}
 		}
 		else if(s.type==5)//put上传文件
