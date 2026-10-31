@@ -7,17 +7,16 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+#include "../common/protocol.h"
+
+#define TYPE_LIST_VERSIONS 12
+#define TYPE_DOWNLOAD_VERSION 13
+
 int islogin=0;//登录状态
 char loginUsername[50];//登录成功的用户名
-struct net_info
-{
-    int type;//1.register 2.login 3.list 4.get 5.put 6.history 7.exit
-    char username[50];//用户名
-    char password[50];//密码
-    char filename[50];//文件名
-    char info[500];//文件内容
-    int info_len;//内容长度
-};
+volatile int version_selection_in_progress=0;
+int version_download_mode=0;
+int version_repository_id=0;
 void* func(void* p)
 {
     int sockfd = *(int *)p;
@@ -64,15 +63,75 @@ void* func(void* p)
 				fclose(fp);
 			}
 		}
+		if(s.type==TYPE_COMMIT)
+		{
+			printf("%s\n",s.info);
+		}
+		if(s.type==TYPE_LIST_VERSIONS)
+		{
+			if(s.repository_id==-1)
+			{
+				if(version_download_mode)
+				{
+					int version;
+					printf("请输入版本号：\n");
+					scanf("%d",&version);
+					struct net_info request = {0};
+					request.type = TYPE_DOWNLOAD_VERSION;
+					request.repository_id = version_repository_id;
+					request.base_version = version;
+					strcpy(request.username,loginUsername);
+					send_packet(sockfd,&request);
+					version_selection_in_progress=0;
+					version_download_mode=0;
+				}
+			}
+			else
+			{
+				printf("版本 %d\n提交说明：%s\n时间：%s\n",
+					s.base_version,s.commit_message,s.info);
+			}
+		}
+		if(s.type==TYPE_DOWNLOAD_VERSION)
+		{
+			if(strcmp(s.info,"开始下载")==0)
+			{
+				FILE* fp=fopen(s.filename,"w");
+				if(fp!=NULL) fclose(fp);
+				printf("开始下载版本 %d：%s\n",s.base_version,s.filename);
+			}
+			else
+			{
+				printf("%s\n",s.info);
+			}
+		}
 		if(s.type==6)//history
 		{
 			printf("%s\n",s.info);
+		}
+		if(s.type==7)//注销账号
+		{
+			printf("%s\n",s.info);
+			if(strcmp("账号注销成功",s.info)==0)
+			{
+				islogin=0;
+				loginUsername[0]='\0';
+			}
+		}
+		if(s.type==9)//创建代码仓库
+		{
+			printf("%s\n",s.info);
+		}
+		if(s.type==10)//查看我的代码仓库
+		{
+			printf("仓库ID：%d 仓库名称：%s %s\n",s.info_len,s.filename,s.info);
 		}
     }
 }
 
 int main(int argc, char* argv[])
 {
+	(void)argc;
     //./send 127.0.0.1 8888
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	printf("%d\n", sockfd);
@@ -94,7 +153,8 @@ int main(int argc, char* argv[])
     while(1)
     {
 		struct net_info s;
-   		printf("1.register 2.login 3.list 4.get 5.put 6.history 7.exit\n");
+		while(version_selection_in_progress) usleep(10000);
+		printf("1.register 2.login 3.list 4.get 5.put 6.history 7.delete account 8.exit 9.create repository 10.list my repositories 11.commit code 12.list versions 13.download version\n");
 		printf("请输入您的选择:\n");
 		scanf("%d",&s.type);
 		if(s.type==1)//注册
@@ -151,7 +211,7 @@ int main(int argc, char* argv[])
 						fclose(fp1);//关闭只读
 						strcpy(s.username,loginUsername);
 						FILE* fp=fopen(s.filename,"r");//读取文件
-						s.info_len==0;
+						s.info_len=0;
 						fseek(fp,0,SEEK_END);
 						s.info_len=ftell(fp);//求文件大小
 						fclose(fp);
@@ -199,11 +259,90 @@ int main(int argc, char* argv[])
 			}
 
 		}
-		else if(s.type==7)//exit
+		else if(s.type==7)//注销账号
+		{
+			if(islogin==0)
+			{
+				printf("当前未登录\n");
+				continue;
+			}
+			strcpy(s.username,loginUsername);
+		}
+		else if(s.type==8)//exit
 		{
 			printf("程序结束\n");
 			close(sockfd);
 			exit(0);//结束进程
+		}
+		else if(s.type==9)//创建代码仓库
+		{
+			if(islogin==0)
+			{
+				printf("请登录\n");
+				continue;
+			}
+			printf("请输入仓库名称：\n");
+			scanf("%49s",s.filename);
+			printf("请输入仓库描述：\n");
+			scanf(" %499[^\n]",s.info);
+			strcpy(s.username,loginUsername);
+		}
+		else if(s.type==10)//查看我的代码仓库
+		{
+			if(islogin==0)
+			{
+				printf("请登录\n");
+				continue;
+			}
+			strcpy(s.username,loginUsername);
+			s.info_len=0;
+		}
+		else if(s.type==TYPE_COMMIT)
+		{
+			if(islogin==0)
+			{
+				printf("请登录\n");
+				continue;
+			}
+			printf("请输入仓库ID：\n");
+			scanf("%d",&s.repository_id);
+			printf("请输入代码文件名：\n");
+			scanf("%255s",s.filename);
+			printf("请输入提交说明：\n");
+			scanf(" %255[^\n]",s.commit_message);
+			strcpy(s.username,loginUsername);
+			s.info_len=-1;
+			send_packet(sockfd,&s);
+			FILE* fp=fopen(s.filename,"rb");
+			if(fp==NULL)
+			{
+				printf("本地文件打开失败\n");
+				continue;
+			}
+			while((s.info_len=(int)fread(s.info,1,sizeof(s.info),fp))>0)
+			{
+				send_packet(sockfd,&s);
+			}
+			fclose(fp);
+			continue;
+		}
+		else if(s.type==TYPE_LIST_VERSIONS || s.type==TYPE_DOWNLOAD_VERSION)
+		{
+			if(islogin==0)
+			{
+				printf("请登录\n");
+				continue;
+			}
+			printf("请输入仓库ID：\n");
+			scanf("%d",&s.repository_id);
+			strcpy(s.username,loginUsername);
+			if(s.type==TYPE_DOWNLOAD_VERSION)
+			{
+				version_download_mode=1;
+				version_repository_id=s.repository_id;
+				version_selection_in_progress=1;
+				s.type=TYPE_LIST_VERSIONS;
+			}
 		}
         send(sockfd,&s,sizeof(s), 0);
 		sleep(1);//给服务器的时间

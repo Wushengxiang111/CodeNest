@@ -8,28 +8,30 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <time.h>
+#include "../common/protocol.h"
+
+#define TYPE_LIST_VERSIONS 12
+#define TYPE_DOWNLOAD_VERSION 13
+
 sqlite3* db;//所有线程共用一个数据库
-struct net_info
-{
-    int type;//1.register 2.login 3.list 4.get 5.put 6.history 7.exit
-    char username[50];//用户名
-    char password[50];//密码
-    char filename[50];//文件名
-    char info[500];//文件内容
-    int info_len;//内容长度
-};
+pthread_mutex_t repository_mutex = PTHREAD_MUTEX_INITIALIZER;
 //插入历史记录
 void insert_history(char* username,char* action)
 {
 	time_t t=time(0);
 	struct tm* tp=localtime(&t);
 	char time[100];
-	sprintf(time,"%d-%d-%d %02d:%02d:%02d",tp->tm_year+1900,tp->tm_mon+1,tp->tm_mday,
+	snprintf(time, sizeof(time), "%d-%d-%d %02d:%02d:%02d",tp->tm_year+1900,tp->tm_mon+1,tp->tm_mday,
 			tp->tm_hour,tp->tm_min,tp->tm_sec);
 	char sql[300];
-	sprintf(sql,"insert into history_info values('%s','%s','%s');",username,time,action);
+	if(snprintf(sql, sizeof(sql), "insert into history_info values('%s','%s','%s');", username,time,action) >= (int)sizeof(sql))
+	{
+		return;
+	}
 	char *err;
 	int ret=sqlite3_exec(db,sql,NULL,NULL,&err);
 	if(ret!=SQLITE_OK)
@@ -38,12 +40,388 @@ void insert_history(char* username,char* action)
 	}
 }
 
+//初始化代码仓库表
+void init_repository_table()
+{
+	char* err = NULL;
+	char* sql = "create table if not exists repositories ("
+		"id integer primary key autoincrement,"
+		"name text not null,"
+		"owner_id text not null,"
+		"description text default '',"
+		"current_version integer default 0,"
+		"create_time text not null);";
+	int ret = sqlite3_exec(db, sql, NULL, NULL, &err);
+	if(ret != SQLITE_OK)
+	{
+		printf("创建repositories表失败:%s\n", err);
+		sqlite3_free(err);
+	}
+}
+
+void init_commits_table()
+{
+	char* err = NULL;
+	char* sql = "create table if not exists commits ("
+		"id integer primary key autoincrement,"
+		"repository_id integer not null,"
+		"user_id text not null,"
+		"version integer not null,"
+		"parent_version integer not null,"
+		"message text not null,"
+		"create_time text not null,"
+		"path text not null);";
+	if(sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK)
+	{
+		printf("创建commits表失败:%s\n", err);
+		sqlite3_free(err);
+	}
+}
+
+int repository_owner(int repository_id, const char* username)
+{
+	char sql[300];
+	char** q;
+	char* err = NULL;
+	int nrow, ncol;
+	if(snprintf(sql, sizeof(sql), "select id from repositories where id=%d and owner_id='%s';",
+		repository_id, username) >= (int)sizeof(sql))
+	{
+		return 0;
+	}
+	int ret = sqlite3_get_table(db, sql, &q, &nrow, &ncol, &err);
+	if(ret != SQLITE_OK)
+	{
+		sqlite3_free(err);
+		return 0;
+	}
+	sqlite3_free_table(q);
+	return nrow > 0;
+}
+
+void my_commit(int newfd, struct net_info s, char* commit_path, size_t path_size, int* commit_active)
+{
+	if(s.info_len != -1)
+	{
+		if(!*commit_active)
+		{
+			return;
+		}
+		FILE* fp = fopen(commit_path, "ab");
+		if(fp != NULL)
+		{
+			fwrite(s.info, 1, s.info_len, fp);
+			fclose(fp);
+		}
+		return;
+	}
+
+	pthread_mutex_lock(&repository_mutex);
+	if(!repository_owner(s.repository_id, s.username))
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "你没有权限访问该仓库");
+		s.type = TYPE_COMMIT;
+		send_packet(newfd, &s);
+		return;
+	}
+
+	char sql[1200];
+	char** q;
+	char* err = NULL;
+	int nrow, ncol;
+	if(snprintf(sql, sizeof(sql), "select current_version from repositories where id=%d;", s.repository_id)
+		>= (int)sizeof(sql))
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "仓库查询失败");
+		send_packet(newfd, &s);
+		return;
+	}
+	if(sqlite3_get_table(db, sql, &q, &nrow, &ncol, &err) != SQLITE_OK || nrow == 0)
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "仓库不存在");
+		send_packet(newfd, &s);
+		return;
+	}
+	int parent_version = atoi(q[1]);
+	int new_version = parent_version + 1;
+	sqlite3_free_table(q);
+
+	if(snprintf(commit_path, path_size, "repositories/%d/versions/%d/%s",
+		s.repository_id, new_version, s.filename) >= (int)path_size)
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "版本路径过长");
+		send_packet(newfd, &s);
+		return;
+	}
+	char version_dir[300];
+	if(snprintf(version_dir, sizeof(version_dir), "repositories/%d/versions/%d",
+		s.repository_id, new_version) >= (int)sizeof(version_dir))
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "版本路径过长");
+		send_packet(newfd, &s);
+		return;
+	}
+	mkdir("repositories", 0755);
+	char repository_dir[100];
+	if(snprintf(repository_dir, sizeof(repository_dir), "repositories/%d", s.repository_id)
+		>= (int)sizeof(repository_dir))
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "仓库路径过长");
+		send_packet(newfd, &s);
+		return;
+	}
+	mkdir(repository_dir, 0755);
+	char versions_dir[150];
+	if(snprintf(versions_dir, sizeof(versions_dir), "%s/versions", repository_dir)
+		>= (int)sizeof(versions_dir))
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "版本路径过长");
+		send_packet(newfd, &s);
+		return;
+	}
+	mkdir(versions_dir, 0755);
+	mkdir(version_dir, 0755);
+
+	FILE* fp = fopen(commit_path, "wb");
+	if(fp == NULL)
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "版本文件创建失败");
+		send_packet(newfd, &s);
+		return;
+	}
+	fclose(fp);
+
+	char create_time[100];
+	time_t now = time(NULL);
+	struct tm* tm_now = localtime(&now);
+	snprintf(create_time, sizeof(create_time), "%d-%d-%d %02d:%02d:%02d", tm_now->tm_year + 1900,
+		tm_now->tm_mon + 1, tm_now->tm_mday, tm_now->tm_hour, tm_now->tm_min, tm_now->tm_sec);
+	if(snprintf(sql, sizeof(sql), "insert into commits(repository_id,user_id,version,parent_version,message,create_time,path) "
+		"values(%d,'%s',%d,%d,'%s','%s','%s');", s.repository_id, s.username,
+		new_version, parent_version, s.commit_message, create_time, commit_path) >= (int)sizeof(sql))
+	{
+		*commit_active = 0;
+		pthread_mutex_unlock(&repository_mutex);
+		strcpy(s.info, "提交记录过长");
+		send_packet(newfd, &s);
+		return;
+	}
+	if(sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK)
+	{
+		printf("提交记录保存失败:%s\n", err);
+		sqlite3_free(err);
+	}
+	snprintf(sql, sizeof(sql), "update repositories set current_version=%d where id=%d;",
+		new_version, s.repository_id);
+	sqlite3_exec(db, sql, NULL, NULL, &err);
+	pthread_mutex_unlock(&repository_mutex);
+
+	s.base_version = new_version;
+	*commit_active = 1;
+	s.type = TYPE_COMMIT;
+	snprintf(s.info, sizeof(s.info), "提交成功，版本 %d", new_version);
+	send_packet(newfd, &s);
+}
+
+void my_list_versions(int newfd, struct net_info s)
+{
+	if(!repository_owner(s.repository_id, s.username))
+	{
+		strcpy(s.info, "你没有权限访问该仓库");
+		s.type = TYPE_LIST_VERSIONS;
+		s.repository_id = -1;
+		send_packet(newfd, &s);
+		return;
+	}
+	char sql[300];
+	char** q;
+	char* err = NULL;
+	int nrow, ncol;
+	if(snprintf(sql, sizeof(sql), "select version,message,create_time from commits where repository_id=%d order by version desc;",
+		s.repository_id) >= (int)sizeof(sql))
+	{
+		strcpy(s.info, "版本查询失败");
+		s.type = TYPE_LIST_VERSIONS;
+		s.repository_id = -1;
+		send_packet(newfd, &s);
+		return;
+	}
+	if(sqlite3_get_table(db, sql, &q, &nrow, &ncol, &err) == SQLITE_OK)
+	{
+		for(int i = 1; i <= nrow; i++)
+		{
+			s.type = TYPE_LIST_VERSIONS;
+			s.base_version = atoi(q[i * ncol]);
+			strcpy(s.commit_message, q[i * ncol + 1]);
+			strcpy(s.info, q[i * ncol + 2]);
+			send_packet(newfd, &s);
+		}
+		sqlite3_free_table(q);
+	}
+	s.type = TYPE_LIST_VERSIONS;
+	s.repository_id = -1;
+	send_packet(newfd, &s);
+}
+
+void my_download_version(int newfd, struct net_info s)
+{
+	if(!repository_owner(s.repository_id, s.username))
+	{
+		strcpy(s.info, "你没有权限访问该仓库");
+		s.type = TYPE_DOWNLOAD_VERSION;
+		send_packet(newfd, &s);
+		return;
+	}
+	char sql[300];
+	char** q;
+	char* err = NULL;
+	int nrow, ncol;
+	if(snprintf(sql, sizeof(sql), "select path from commits where repository_id=%d and version=%d;",
+		s.repository_id, s.base_version) >= (int)sizeof(sql))
+	{
+		strcpy(s.info, "版本查询失败");
+		s.type = TYPE_DOWNLOAD_VERSION;
+		send_packet(newfd, &s);
+		return;
+	}
+	if(sqlite3_get_table(db, sql, &q, &nrow, &ncol, &err) != SQLITE_OK || nrow == 0)
+	{
+		strcpy(s.info, "版本不存在");
+		s.type = TYPE_DOWNLOAD_VERSION;
+		send_packet(newfd, &s);
+		return;
+	}
+	char path[300];
+	strcpy(path, q[1]);
+	sqlite3_free_table(q);
+	FILE* fp = fopen(path, "rb");
+	if(fp == NULL)
+	{
+		strcpy(s.info, "版本文件不存在");
+		s.type = TYPE_DOWNLOAD_VERSION;
+		send_packet(newfd, &s);
+		return;
+	}
+	strcpy(s.filename, strrchr(path, '/') + 1);
+	s.type = TYPE_DOWNLOAD_VERSION;
+	strcpy(s.info, "开始下载");
+	send_packet(newfd, &s);
+	s.type = TYPE_GET;
+	while((s.info_len = fread(s.info, 1, sizeof(s.info), fp)) > 0)
+	{
+		send_packet(newfd, &s);
+	}
+	fclose(fp);
+}
+
+//创建代码仓库
+void my_create_repository(int newfd, struct net_info s)
+{
+	char sql[1200];
+	char create_time[100];
+	time_t t = time(0);
+	struct tm* tp = localtime(&t);
+	snprintf(create_time, sizeof(create_time), "%d-%d-%d %02d:%02d:%02d", tp->tm_year + 1900,
+		tp->tm_mon + 1, tp->tm_mday, tp->tm_hour, tp->tm_min, tp->tm_sec);
+	if(snprintf(sql, sizeof(sql), "insert into repositories(name,owner_id,description,current_version,create_time) "
+		"values('%s','%s','%s',0,'%s');", s.filename, s.username, s.info, create_time)
+		>= (int)sizeof(sql))
+	{
+		strcpy(s.info, "仓库信息过长");
+		send(newfd, &s, sizeof(s), 0);
+		return;
+	}
+	char* err = NULL;
+	int ret = sqlite3_exec(db, sql, NULL, NULL, &err);
+	if(ret != SQLITE_OK)
+	{
+		strcpy(s.info, "创建仓库失败");
+		printf("[%s]%s\n", sql, err);
+		sqlite3_free(err);
+		send(newfd, &s, sizeof(s), 0);
+		return;
+	}
+
+	s.info_len = (int)sqlite3_last_insert_rowid(db);
+	char repository_path[100];
+	char versions_path[120];
+	snprintf(repository_path, sizeof(repository_path), "repositories/%d", s.info_len);
+	snprintf(versions_path, sizeof(versions_path), "%s/versions", repository_path);
+	if((mkdir("repositories", 0755) != 0 && access("repositories", F_OK) != 0) ||
+		(mkdir(repository_path, 0755) != 0 && access(repository_path, F_OK) != 0) ||
+		(mkdir(versions_path, 0755) != 0 && access(versions_path, F_OK) != 0))
+	{
+		strcpy(s.info, "仓库创建成功，但目录创建失败");
+	}
+	else
+	{
+		snprintf(s.info, sizeof(s.info), "仓库创建成功，repository_id=%d", s.info_len);
+	}
+	send(newfd, &s, sizeof(s), 0);
+}
+
+//查看当前用户拥有的代码仓库
+void my_list_repository(int newfd, struct net_info s)
+{
+	char sql[300];
+	if(snprintf(sql, sizeof(sql), "select id,name,description,current_version from repositories where owner_id='%s';",
+		s.username) >= (int)sizeof(sql))
+	{
+		strcpy(s.info, "查询条件过长");
+		send(newfd, &s, sizeof(s), 0);
+		return;
+	}
+	char** q;
+	char* err;
+	int nrow, ncol;
+	int ret = sqlite3_get_table(db, sql, &q, &nrow, &ncol, &err);
+	if(ret != SQLITE_OK)
+	{
+		strcpy(s.info, "查询仓库失败");
+		send(newfd, &s, sizeof(s), 0);
+		return;
+	}
+	if(nrow == 0)
+	{
+		strcpy(s.info, "当前没有代码仓库");
+		send(newfd, &s, sizeof(s), 0);
+	}
+	else
+	{
+		for(int i = 1; i <= nrow; i++)
+		{
+			s.info_len = atoi(q[i * ncol]);
+			strcpy(s.filename, q[i * ncol + 1]);
+			snprintf(s.info, sizeof(s.info), "描述：%s 当前版本：%s", q[i * ncol + 2], q[i * ncol + 3]);
+			send(newfd, &s, sizeof(s), 0);
+			usleep(100);
+		}
+	}
+	sqlite3_free_table(q);
+}
+
 //注册
 void my_register(int newfd,struct net_info s)
 {
 	//判断用户名是否存在
 	char sql[200];
-	sprintf(sql,"select * from user_info where username='%s';",s.username);
+	snprintf(sql, sizeof(sql), "select * from user_info where username='%s';", s.username);
 	char** q;
 	char* err;
 	int nrow,ncol;
@@ -56,7 +434,7 @@ void my_register(int newfd,struct net_info s)
 		}
 		else if(nrow==0)
 		{
-			sprintf(sql,"insert into user_info values('%s','%s');",s.username,s.password);
+			snprintf(sql, sizeof(sql), "insert into user_info values('%s','%s');", s.username, s.password);
 			ret=sqlite3_exec(db,sql,NULL,NULL,&err);//执行除了查询之外的sql语句
 			if(ret!=SQLITE_OK)
 			{
@@ -85,7 +463,7 @@ void my_login(int newfd,struct net_info s)
 {
 	//判断用户名和密码是否正确
 	char sql[200];
-	sprintf(sql,"select * from user_info where username='%s' and password='%s';",s.username,s.password);
+	snprintf(sql, sizeof(sql), "select * from user_info where username='%s' and password='%s';", s.username, s.password);
 	char** q;
 	char* err;
 	int nrow,ncol;
@@ -135,16 +513,20 @@ void my_list(int newfd,struct net_info s)
 void my_get(int newfd,struct net_info s)
 {
 	//拼接地址
-	char address[100];
-	sprintf(address,"%s/%s",s.username,s.filename);
+	char address[50 + NETDISK_NAME_SIZE + 2];
+	if(snprintf(address, sizeof(address), "%s/%s", s.username, s.filename) >= (int)sizeof(address))
+	{
+		printf("文件路径过长\n");
+		return;
+	}
 	FILE* fp=fopen(address,"r");
-	fseek(fp,s.info_len,SEEK_SET);//移动文件指针位置
 	if(fp==NULL)
 	{
 		printf("打开失败");
 	}
 	else
 	{
+		fseek(fp,s.info_len,SEEK_SET);//移动文件指针位置
 		int ret=fread(s.info,1,sizeof(s.info),fp);
 		while(ret>0)
 		{
@@ -162,8 +544,12 @@ void my_get(int newfd,struct net_info s)
 //上传文件
 void my_put(int newfd,struct net_info s)
 {
-	char address[100];
-	sprintf(address,"%s/%s",s.username,s.filename);
+	char address[50 + NETDISK_NAME_SIZE + 2];
+	if(snprintf(address, sizeof(address), "%s/%s", s.username, s.filename) >= (int)sizeof(address))
+	{
+		printf("文件路径过长\n");
+		return;
+	}
 	if(s.info_len==-1)
 	{
 		insert_history(s.username,"put");//put可能执行很多次
@@ -180,8 +566,8 @@ void my_put(int newfd,struct net_info s)
 //查看历史
 void my_history(int newfd,struct net_info s)
 {
-	char sql[100];
-	sprintf(sql,"select * from history_info where username='%s';",s.username);
+	char sql[200];
+	snprintf(sql, sizeof(sql), "select * from history_info where username='%s';", s.username);
 	char **q;
 	int nrow,ncol;
 	char* err;
@@ -197,7 +583,7 @@ void my_history(int newfd,struct net_info s)
 		{
 			for(int i=0;i<nrow+1/*表头的存在*/;i++)
 			{
-				sprintf(s.info,"%s %s %s",q[i*3],q[i*3+1],q[i*3+2]);
+				snprintf(s.info, sizeof(s.info), "%s %s %s", q[i*3], q[i*3+1], q[i*3+2]);
 				send(newfd,&s,sizeof(s),0);
 				usleep(200);
 			}
@@ -207,6 +593,72 @@ void my_history(int newfd,struct net_info s)
 	{
 		printf("[%s]%s\n",sql,err);
 	}
+}
+int remove_user_directory(const char* path)
+{
+	DIR* dp=opendir(path);
+	if(dp==NULL)
+	{
+		return -1;
+	}
+	struct dirent* ep=readdir(dp);
+	while(ep!=NULL)
+	{
+		if(strcmp(ep->d_name,".")!=0 && strcmp(ep->d_name,"..")!=0)
+		{
+			char child[512];
+			struct stat st;
+			if(snprintf(child, sizeof(child), "%s/%s", path, ep->d_name) >= (int)sizeof(child))
+			{
+				closedir(dp);
+				return -1;
+			}
+			if(stat(child,&st)!=0)
+			{
+				closedir(dp);
+				return -1;
+			}
+			if(S_ISDIR(st.st_mode))
+			{
+				if(remove_user_directory(child)!=0)
+				{
+					closedir(dp);
+					return -1;
+				}
+			}
+			else if(remove(child)!=0)
+			{
+				closedir(dp);
+				return -1;
+			}
+		}
+		ep=readdir(dp);
+	}
+	closedir(dp);
+	return rmdir(path);
+}
+//注销账号并删除账号数据
+void my_delete_account(int newfd,struct net_info s)
+{
+	char sql[200];
+	char* err;
+	int ret;
+	snprintf(sql, sizeof(sql), "delete from history_info where username='%s';", s.username);
+	ret=sqlite3_exec(db,sql,NULL,NULL,&err);
+	if(ret==SQLITE_OK)
+	{
+		snprintf(sql, sizeof(sql), "delete from user_info where username='%s';", s.username);
+		ret=sqlite3_exec(db,sql,NULL,NULL,&err);
+	}
+	if(ret==SQLITE_OK && remove_user_directory(s.username)==0)
+	{
+		strcpy(s.info,"账号注销成功");
+	}
+	else
+	{
+		strcpy(s.info,"账号注销失败");
+	}
+	send(newfd,&s,sizeof(s),0);
 }
 void* func(void* p)
 {
@@ -223,6 +675,8 @@ void* func(void* p)
     		break;
     	}
 		printf("type is %d\n",s.type);
+		static __thread char commit_path[300];
+		static __thread int commit_active = 0;
         if(s.type==1)
 		{
 			my_register(newfd,s);//执行注册操作
@@ -247,6 +701,34 @@ void* func(void* p)
 		{
 			my_history(newfd,s);
 		}
+		else if(s.type==7)//注销账号
+		{
+			my_delete_account(newfd,s);
+		}
+		else if(s.type==8)//退出
+		{
+			break;
+		}
+		else if(s.type==9)//创建代码仓库
+		{
+			my_create_repository(newfd,s);
+		}
+		else if(s.type==10)//查看我的代码仓库
+		{
+			my_list_repository(newfd,s);
+		}
+		else if(s.type==TYPE_COMMIT)
+		{
+			my_commit(newfd, s, commit_path, sizeof(commit_path), &commit_active);
+		}
+		else if(s.type==TYPE_LIST_VERSIONS)
+		{
+			my_list_versions(newfd, s);
+		}
+		else if(s.type==TYPE_DOWNLOAD_VERSION)
+		{
+			my_download_version(newfd, s);
+		}
 	}
 	close(newfd);//链接通道关闭
 	return NULL;
@@ -261,6 +743,8 @@ int main()
 		printf("打开数据库失败\n");
 		return 0;//结束程序
 	}
+	init_repository_table();
+	init_commits_table();
     //1.创建
    	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     

@@ -113,7 +113,8 @@ struct net_info
 |    4 | 下载文件   |
 |    5 | 上传文件   |
 |    6 | 查看历史记录 |
-|    7 | 退出     |
+|    7 | 注销账号     |
+|    8 | 退出     |
 
 ---
 
@@ -480,7 +481,8 @@ gcc client/client.c -o client/client -lpthread
 4.get
 5.put
 6.history
-7.exit
+7.delete account
+8.exit
 ```
 
 对应功能：
@@ -492,7 +494,8 @@ gcc client/client.c -o client/client -lpthread
 4 → 下载文件
 5 → 上传文件
 6 → 查看历史记录
-7 → 退出程序
+7 → 注销当前账号并删除账号数据
+8 → 退出程序
 ```
 
 ---
