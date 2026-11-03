@@ -17,6 +17,8 @@ char loginUsername[50];//登录成功的用户名
 volatile int version_selection_in_progress=0;
 int version_download_mode=0;
 int version_repository_id=0;
+
+/* 后台接收服务端响应，并按响应 type 显示结果或写入下载数据。 */
 void* func(void* p)
 {
     int sockfd = *(int *)p;
@@ -71,6 +73,7 @@ void* func(void* p)
 		{
 			if(s.repository_id==-1)
 			{
+				/* 下载流程先列出版本；收到结束标记后再请求用户选定的版本。 */
 				if(version_download_mode)
 				{
 					int version;
@@ -129,6 +132,63 @@ void* func(void* p)
     }
 }
 
+// 菜单选项只负责分组展示，返回值仍是原有的协议 type。
+static int select_operation(void)
+{
+	int choice;
+
+	if(!islogin)
+	{
+		printf("\n=== NETDISK ===\n");
+		printf("1. 注册账号\n2. 登录\n0. 退出程序\n");
+		printf("请选择：\n");
+		scanf("%d", &choice);
+		switch(choice)
+		{
+			case 1: return TYPE_REGISTER;
+			case 2: return TYPE_LOGIN;
+			case 0: return TYPE_EXIT;
+			default: printf("无效选项\n"); return 0;
+		}
+	}
+
+	printf("\n=== 主菜单 ===\n");
+	printf("1. 网盘文件\n2. 代码仓库\n3. 操作历史\n4. 注销账号（删除账号文件）\n0. 退出程序\n");
+	printf("请选择：\n");
+	scanf("%d", &choice);
+	switch(choice)
+	{
+		case 1:
+			printf("\n=== 网盘文件 ===\n1. 文件列表\n2. 上传文件\n3. 下载文件\n0. 返回\n");
+			scanf("%d", &choice);
+			switch(choice)
+			{
+				case 0: return 0;
+				case 1: return TYPE_LIST;
+				case 2: return TYPE_PUT;
+				case 3: return TYPE_GET;
+				default: printf("无效选项\n"); return 0;
+			}
+		case 2:
+			printf("\n=== 代码仓库 ===\n1. 我的仓库\n2. 创建仓库\n3. 提交代码\n4. 查看版本\n5. 下载版本\n0. 返回\n");
+			scanf("%d", &choice);
+			switch(choice)
+			{
+				case 0: return 0;
+				case 1: return TYPE_LIST_REPO;
+				case 2: return TYPE_CREATE_REPO;
+				case 3: return TYPE_COMMIT;
+				case 4: return TYPE_LIST_VERSIONS;
+				case 5: return TYPE_DOWNLOAD_VERSION;
+				default: printf("无效选项\n"); return 0;
+			}
+		case 3: return TYPE_HISTORY;
+		case 4: return TYPE_DELETE_ACCOUNT;
+		case 0: return TYPE_EXIT;
+		default: printf("无效选项\n"); return 0;
+	}
+}
+
 int main(int argc, char* argv[])
 {
 	(void)argc;
@@ -152,11 +212,14 @@ int main(int argc, char* argv[])
     //发送
     while(1)
     {
-		struct net_info s;
+		struct net_info s = {0};
 		while(version_selection_in_progress) usleep(10000);
-		printf("1.register 2.login 3.list 4.get 5.put 6.history 7.delete account 8.exit 9.create repository 10.list my repositories 11.commit code 12.list versions 13.download version\n");
-		printf("请输入您的选择:\n");
-		scanf("%d",&s.type);
+		s.type = select_operation();
+		if(s.type == 0)
+		{
+			/* 子菜单的“返回”只回到主循环，不发送网络请求。 */
+			continue;
+		}
 		if(s.type==1)//注册
 		{
 			printf("请您输入账号和密码:\n");
@@ -350,4 +413,3 @@ int main(int argc, char* argv[])
     
 	close(sockfd);//关闭socket使用close
 }
-

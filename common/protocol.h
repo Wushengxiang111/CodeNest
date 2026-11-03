@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <sys/socket.h>
 
+/* 客户端与服务端共用的请求编号；新增或调整编号时两端保持一致。 */
 #define TYPE_REGISTER 1
 #define TYPE_LOGIN 2
 #define TYPE_LIST 3
@@ -20,6 +21,7 @@
 #define NETDISK_INFO_SIZE 500
 #define NETDISK_MESSAGE_SIZE 256
 
+/* 固定长度的通信数据包。info/info_len 也用于分块传输文件内容。 */
 struct net_info
 {
     int type;
@@ -34,6 +36,7 @@ struct net_info
     char commit_message[NETDISK_MESSAGE_SIZE];
 };
 
+/* TCP 是字节流，循环收发直到指定长度的数据全部处理完。 */
 static inline int send_all(int sockfd, const void *buffer, size_t length)
 {
     const char *data = (const char *)buffer;
@@ -68,6 +71,7 @@ static inline int recv_all(int sockfd, void *buffer, size_t length)
     return 0;
 }
 
+/* 数据包接口：当前协议直接传输整个 struct net_info。 */
 static inline int send_packet(int sockfd, const struct net_info *packet)
 {
     return send_all(sockfd, packet, sizeof(*packet));

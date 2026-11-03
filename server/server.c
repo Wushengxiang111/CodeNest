@@ -19,6 +19,7 @@
 
 sqlite3* db;//所有线程共用一个数据库
 pthread_mutex_t repository_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 //插入历史记录
 void insert_history(char* username,char* action)
 {
@@ -99,6 +100,7 @@ int repository_owner(int repository_id, const char* username)
 	return nrow > 0;
 }
 
+/* 提交首包创建版本记录和目标文件，后续数据包追加文件内容。 */
 void my_commit(int newfd, struct net_info s, char* commit_path, size_t path_size, int* commit_active)
 {
 	if(s.info_len != -1)
@@ -279,6 +281,7 @@ void my_list_versions(int newfd, struct net_info s)
 	send_packet(newfd, &s);
 }
 
+/* 校验仓库归属后，根据版本记录中的路径发送对应文件内容。 */
 void my_download_version(int newfd, struct net_info s)
 {
 	if(!repository_owner(s.repository_id, s.username))
@@ -637,6 +640,7 @@ int remove_user_directory(const char* path)
 	closedir(dp);
 	return rmdir(path);
 }
+
 //注销账号并删除账号数据
 void my_delete_account(int newfd,struct net_info s)
 {
@@ -675,6 +679,7 @@ void* func(void* p)
     		break;
     	}
 		printf("type is %d\n",s.type);
+		/* 每个连接线程独立维护正在接收的提交文件路径和状态。 */
 		static __thread char commit_path[300];
 		static __thread int commit_active = 0;
         if(s.type==1)
@@ -776,4 +781,3 @@ int main()
     //6.关闭
     close(sockfd);
 }
-
